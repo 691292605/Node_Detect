@@ -198,7 +198,7 @@ def analyze_and_scan_topology_v3(img_bgr, page_id):
 
             # 【关键修改 3】对于横平竖直的线，大幅降低阈值
             # 即使修复了掩码，虚线可能还是有点断断续续，只要 40% 是白的就算通
-            return ratio > 0.40
+            return ratio > 0.90
 
         else:
             # 斜线依然保持严格逻辑
@@ -229,7 +229,7 @@ def analyze_and_scan_topology_v3(img_bgr, page_id):
             max_zeros = max(max_zeros, curr_zeros)
 
             if max_zeros > 12: return False
-            return ratio > 0.80
+            return ratio > 0.90
 
     # 2.3 主循环
     vis_final = img_bgr.copy()
@@ -317,7 +317,7 @@ def save_to_csv_v3(all_data, filename="topology_results_v3.csv"):
 
 def process_pdf(pdf_path, poppler_path, password):
     print(f"正在读取 PDF: {pdf_path}")
-    images = convert_from_path(pdf_path, dpi=250, poppler_path=poppler_path, userpw=password)
+    images = convert_from_path(pdf_path, dpi=200, poppler_path=poppler_path, userpw=password)
     all_pages_data = []
     for i, pil_img in enumerate(images):
         img_np = np.array(pil_img)
