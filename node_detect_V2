@@ -186,10 +186,10 @@ def analyze_and_scan_topology_v2(img_bgr, page_id):
         # 3. 针对直线放宽标准
         if is_manhattan:
             if max_consecutive_zeros > 20: return False
-            return ratio > 0.45
+            return ratio > 0.75
         else:
             if max_consecutive_zeros > 12: return False
-            return ratio > 0.80
+            return ratio > 0.95
 
     # 2.3 主循环
     vis_final = img_bgr.copy()
@@ -278,7 +278,7 @@ def save_to_csv_v2(all_data, filename="topology_results_v2.csv"):
 
 def process_pdf(pdf_path, poppler_path, password):
     print(f"正在读取 PDF: {pdf_path}")
-    images = convert_from_path(pdf_path, dpi=250, poppler_path=poppler_path, userpw=password)
+    images = convert_from_path(pdf_path, dpi=200, poppler_path=poppler_path, userpw=password)
     all_pages_data = []
     for i, pil_img in enumerate(images):
         img_np = np.array(pil_img)
