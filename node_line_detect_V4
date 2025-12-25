@@ -1,0 +1,448 @@
+import cv2
+import numpy as np
+from pdf2image import convert_from_path
+from PIL import Image
+import csv
+import math
+
+Image.MAX_IMAGE_PIXELS = None
+
+
+# =========================================================
+# 辅助函数：颜色掩码提取
+# =========================================================
+def get_red_mask(img_hsv):
+    lower_red1 = np.array([0, 43, 46])
+    upper_red1 = np.array([10, 255, 255])
+    lower_red2 = np.array([156, 43, 46])
+    upper_red2 = np.array([180, 255, 255])
+    mask1 = cv2.inRange(img_hsv, lower_red1, upper_red1)
+    mask2 = cv2.inRange(img_hsv, lower_red2, upper_red2)
+    return mask1 + mask2
+
+
+def get_yellow_mask(img_hsv):
+    # 黄色 Hue 一般在 20-35 之间
+    lower_yellow = np.array([20, 90, 90])
+    upper_yellow = np.array([35, 255, 255])
+    return cv2.inRange(img_hsv, lower_yellow, upper_yellow)
+
+
+def get_green_mask(img_hsv):
+    # Hue: 35-85 覆盖了大部分工程图的绿色
+    lower_green = np.array([35, 43, 46])
+    upper_green = np.array([85, 255, 255])
+    return cv2.inRange(img_hsv, lower_green, upper_green)
+
+
+def get_black_mask(img_hsv):
+    lower_black = np.array([0, 0, 0])
+    upper_black = np.array([180, 255, 120])
+    return cv2.inRange(img_hsv, lower_black, upper_black)
+
+
+# =========================================================
+# 辅助函数：自适应参数计算
+# =========================================================
+def get_adaptive_params(img_shape):
+    """
+    根据图片宽度动态计算阈值，防止高分辨率图片下文字被误识别为框。
+    基准宽度设定为 1600px (普通 A4 200dpi 扫描件宽度)。
+    """
+    h, w = img_shape[:2]
+    base_width = 1600.0
+    scale = w / base_width
+    area_scale = scale * scale  # 面积缩放是长度缩放的平方
+
+    # 辅助：保证核大小为奇数
+    def get_odd_kernel(val):
+        k = int(val)
+        if k < 3: return 3
+        if k % 2 == 0: k += 1
+        return k
+
+    params = {
+        # --- 面积阈值 (随 area_scale 变化) ---
+        'red_min_area': 150 * area_scale,
+        'red_max_area': 50000 * area_scale,
+
+        'yellow_min_area': 300 * area_scale,
+        'yellow_max_area': 100000 * area_scale,
+
+        'black_min_area': 600 * area_scale,
+        'black_max_area': 20000 * area_scale,
+
+        'dot_min_area': 5 * area_scale,
+        'dot_max_area': 600 * area_scale,
+
+        # --- 距离/长度阈值 (随 scale 变化) ---
+        'neighbor_dist': 800 * scale,  # 搜索邻居的最大距离
+        'max_gap_pixels': int(12 * scale),  # 路径检测允许的最大断点像素数
+
+        # --- 形态学核大小 (随 scale 变化) ---
+        'kernel_small_size': get_odd_kernel(3 * scale),  # 用于普通膨胀
+        'kernel_bridge_size': get_odd_kernel(15 * scale),  # 用于修复被线切断的黄框
+        'kernel_line_fix_len': int(15 * scale)  # 用于修复虚线
+    }
+
+    print(f"   > 图片尺寸: {w}x{h}, 缩放因子: {scale:.2f}")
+    print(f"   > 自适应阈值: 红框最小面积={int(params['red_min_area'])}, 连线距离={int(params['neighbor_dist'])}")
+    return params
+
+
+# =========================================================
+# 核心逻辑
+# =========================================================
+def analyze_and_scan_topology_final(img_bgr, page_id):
+    print(f"\n[处理进度] 正在分析第 {page_id} 页 (自适应分辨率 + 黄框优先 + 虚线修复)...")
+
+    # 1. 获取自适应参数
+    params = get_adaptive_params(img_bgr.shape)
+
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    vis_debug = img_bgr.copy()
+
+    nodes = []
+    forbidden_regions = []  # 用于存储已识别区域，防止低优先级节点重复识别
+
+    # 准备常用核
+    k_small = params['kernel_small_size']
+    kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (k_small, k_small))
+
+    # =========================================================
+    # PART 1: 节点识别 (优先级：黄 > 红 > 黑 > 点)
+    # =========================================================
+
+    # ---------------------------------------------------------
+    # 1.0 黄色框 (最高优先级 + 防切割修复)
+    # ---------------------------------------------------------
+    yellow_mask = get_yellow_mask(hsv)
+
+    # 【修复绿线切割问题】：使用较大的核进行闭运算，连接断开的黄色区域
+    k_bridge = params['kernel_bridge_size']
+    kernel_bridge = cv2.getStructuringElement(cv2.MORPH_RECT, (k_bridge, k_bridge))
+    yellow_mask_clean = cv2.morphologyEx(yellow_mask, cv2.MORPH_CLOSE, kernel_bridge)
+
+    contours_yellow, _ = cv2.findContours(yellow_mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in contours_yellow:
+        area = cv2.contourArea(cnt)
+        x, y, w, h = cv2.boundingRect(cnt)
+        aspect_ratio = float(w) / h
+
+        # 使用自适应面积阈值
+        if area > params['yellow_min_area'] and 0.2 < aspect_ratio < 5.0 and area < params['yellow_max_area']:
+            M = cv2.moments(cnt)
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+                nodes.append({
+                    "id": -1, "type": "yellow_box", "center": (cx, cy),
+                    "bbox": (x, y, w, h), "neighbors": set()
+                })
+                # 锁定区域
+                forbidden_regions.append((x, y, w, h))
+                cv2.rectangle(vis_debug, (x, y), (x + w, y + h), (255, 0, 255), 2)  # 绘制紫色以区分
+
+    # ---------------------------------------------------------
+    # 1.1 红色框
+    # ---------------------------------------------------------
+    red_mask = get_red_mask(hsv)
+    red_mask_clean = cv2.dilate(red_mask, kernel_small, iterations=1)
+    contours_red, _ = cv2.findContours(red_mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in contours_red:
+        area = cv2.contourArea(cnt)
+        x, y, w, h = cv2.boundingRect(cnt)
+        aspect_ratio = float(w) / h
+
+        if area > params['red_min_area'] and 0.2 < aspect_ratio < 5.0 and area < params['red_max_area']:
+            M = cv2.moments(cnt)
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+
+                # 检查是否与黄框重叠 (简单检查)
+                is_duplicate = False
+                for fx, fy, fw, fh in forbidden_regions:
+                    if fx < cx < fx + fw and fy < cy < fy + fh:
+                        is_duplicate = True
+                        break
+
+                if not is_duplicate:
+                    nodes.append({
+                        "id": -1, "type": "red_box", "center": (cx, cy),
+                        "bbox": (x, y, w, h), "neighbors": set()
+                    })
+                    forbidden_regions.append((x, y, w, h))
+                    cv2.rectangle(vis_debug, (x, y), (x + w, y + h), (255, 0, 0), 2)
+
+    # ---------------------------------------------------------
+    # 1.2 黑色框
+    # ---------------------------------------------------------
+    black_mask_strict = get_black_mask(hsv)
+    contours_black, _ = cv2.findContours(black_mask_strict, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in contours_black:
+        area = cv2.contourArea(cnt)
+        x, y, w, h = cv2.boundingRect(cnt)
+
+        if params['black_min_area'] < area < params['black_max_area']:
+            aspect_ratio = float(w) / h
+            if 0.5 < aspect_ratio < 2.5:
+                M = cv2.moments(cnt)
+                if M["m00"] != 0:
+                    cx = int(M["m10"] / M["m00"])
+                    cy = int(M["m01"] / M["m00"])
+
+                    # 关键：检查是否在黄框/红框区域内
+                    is_duplicate = False
+                    for fx, fy, fw, fh in forbidden_regions:
+                        if fx < cx < fx + fw and fy < cy < fy + fh:
+                            is_duplicate = True
+                            break
+                    if not is_duplicate:
+                        nodes.append({
+                            "id": -1, "type": "black_box", "center": (cx, cy),
+                            "bbox": (x, y, w, h), "neighbors": set()
+                        })
+                        forbidden_regions.append((x, y, w, h))
+                        cv2.rectangle(vis_debug, (x, y), (x + w, y + h), (0, 255, 255), 2)
+
+    # ---------------------------------------------------------
+    # 1.3 小圆点
+    # ---------------------------------------------------------
+    kernel_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_small, k_small))
+    eroded_mask = cv2.erode(black_mask_strict, kernel_erode, iterations=1)
+    dots_mask = cv2.dilate(eroded_mask, kernel_erode, iterations=3)
+    contours_dots, _ = cv2.findContours(dots_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in contours_dots:
+        area = cv2.contourArea(cnt)
+
+        if params['dot_min_area'] < area < params['dot_max_area']:
+            x, y, w, h = cv2.boundingRect(cnt)
+            M = cv2.moments(cnt)
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+
+                is_inside_box = False
+                for fx, fy, fw, fh in forbidden_regions:
+                    # 稍微放宽一点边界判断
+                    if (fx - 2) < cx < (fx + fw + 2) and (fy - 2) < cy < (fy + fh + 2):
+                        is_inside_box = True
+                        break
+                if not is_inside_box:
+                    perimeter = cv2.arcLength(cnt, True)
+                    if perimeter == 0: continue
+                    circularity = 4 * np.pi * (area / (perimeter * perimeter))
+                    aspect_ratio = float(w) / h
+                    if 0.5 < aspect_ratio < 2.0 and circularity > 0.6:
+                        nodes.append({
+                            "id": -1, "type": "dot", "center": (cx, cy),
+                            "bbox": (x, y, w, h), "neighbors": set()
+                        })
+                        cv2.rectangle(vis_debug, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+    cv2.imwrite(f"debug_{page_id}_final_nodes.jpg", vis_debug)
+    nodes.sort(key=lambda n: n['center'][1])
+    for idx, node in enumerate(nodes):
+        node['id'] = idx
+
+    # =========================================================
+    # PART 2: 连线逻辑 (虚线修复 + 动态掩码)
+    # =========================================================
+
+    # 2.1 准备线路掩码
+    lower_gray = np.array([0, 0, 0])
+    upper_gray = np.array([180, 50, 200])
+    mask_structure = cv2.inRange(hsv, lower_gray, upper_gray)
+    green_mask = get_green_mask(hsv)
+
+    # 组合所有可能的线路颜色
+    mask_lines = cv2.bitwise_or(mask_structure, red_mask)
+    mask_lines = cv2.bitwise_or(mask_lines, green_mask)
+
+    # 填充节点区域，防止线路在节点内部被截断
+    for node in nodes:
+        x, y, w, h = node['bbox']
+        cv2.rectangle(mask_lines, (x, y), (x + w, y + h), 255, -1)
+
+    # 2.2 强力修复虚线 (使用自适应核大小)
+    fix_len = params['kernel_line_fix_len']
+
+    # 连横虚线
+    kernel_hori = cv2.getStructuringElement(cv2.MORPH_RECT, (fix_len, 1))
+    mask_hori = cv2.morphologyEx(mask_lines, cv2.MORPH_CLOSE, kernel_hori)
+
+    # 连竖虚线
+    kernel_vert = cv2.getStructuringElement(cv2.MORPH_RECT, (1, fix_len))
+    mask_vert = cv2.morphologyEx(mask_lines, cv2.MORPH_CLOSE, kernel_vert)
+
+    mask_lines = cv2.bitwise_or(mask_hori, mask_vert)
+
+    # 最终膨胀，保证线条连接性
+    mask_lines = cv2.dilate(mask_lines, kernel_small, iterations=1)
+
+    cv2.imwrite(f"debug_{page_id}_final_scan_mask.jpg", mask_lines)
+
+    # 2.3 像素路径检测函数 (内部包含自适应 gap check)
+    def check_pixel_path_final(p1, p2, mask, max_gap):
+        dx = p1[0] - p2[0]
+        dy = p1[1] - p2[1]
+
+        angle_deg = math.degrees(math.atan2(abs(dy), abs(dx)))
+        is_horizontal = angle_deg < 5
+        is_vertical = angle_deg > 85
+
+        # 采样路径
+        dist = math.hypot(dx, dy)
+        if dist < 1: return True
+        steps = int(dist)
+        if steps == 0: return True
+
+        x_values = np.linspace(p1[0], p2[0], steps).astype(int)
+        y_values = np.linspace(p1[1], p2[1], steps).astype(int)
+
+        h, w = mask.shape
+        valid = (x_values >= 0) & (x_values < w) & (y_values >= 0) & (y_values < h)
+        x_values = x_values[valid]
+        y_values = y_values[valid]
+        if len(x_values) == 0: return False
+
+        path_pixels = mask[y_values, x_values]
+        non_zero = cv2.countNonZero(path_pixels)
+        ratio = non_zero / len(path_pixels)
+
+        # 逻辑分支
+        if is_horizontal or is_vertical:
+            # 横平竖直：大幅放宽阈值 (只要连通度 > 90% 即可，虚线已被修复)
+            return ratio > 0.90
+        else:
+            # 斜线/其他：增加 Gap Check (连续断点检测)
+            max_zeros = 0
+            curr_zeros = 0
+            for px in path_pixels:
+                if px == 0:
+                    curr_zeros += 1
+                else:
+                    max_zeros = max(max_zeros, curr_zeros)
+                    curr_zeros = 0
+            max_zeros = max(max_zeros, curr_zeros)
+
+            # 使用自适应的 max_gap_pixels
+            if max_zeros > max_gap: return False
+            return ratio > 0.90
+
+    # 2.4 主循环：连线
+    vis_final = img_bgr.copy()
+
+    for i, node_A in enumerate(nodes):
+        pos_A = node_A['center']
+        candidates = []
+        for j, node_B in enumerate(nodes):
+            if i == j: continue
+            dx = node_B['center'][0] - pos_A[0]
+            dy = node_B['center'][1] - pos_A[1]
+            dist = math.hypot(dx, dy)
+
+            # 使用自适应距离阈值
+            if dist < params['neighbor_dist']:
+                angle = math.atan2(dy, dx)
+                candidates.append({"node": node_B, "dist": dist, "angle": angle})
+
+        candidates.sort(key=lambda x: x['dist'])
+
+        accepted_angles = []
+        for cand in candidates:
+            node_B = cand['node']
+            curr_angle = cand['angle']
+
+            # 同向遮挡检测
+            is_blocked_direction = False
+            for theta in accepted_angles:
+                diff = abs(curr_angle - theta)
+                if diff > math.pi: diff = 2 * math.pi - diff
+                if diff < 0.35:  # 约 20 度
+                    is_blocked_direction = True
+                    break
+
+            if is_blocked_direction: continue
+
+            # 路径检测
+            if check_pixel_path_final(pos_A, node_B['center'], mask_lines, params['max_gap_pixels']):
+                node_A['neighbors'].add(node_B['id'])
+                accepted_angles.append(curr_angle)
+                cv2.line(vis_final, pos_A, node_B['center'], (0, 255, 0), 2)
+
+    # 绘制最终结果
+    for node in nodes:
+        color = (0, 255, 0)
+        if len(node['neighbors']) == 0:
+            cv2.circle(vis_final, node['center'], 10, (0, 0, 255), 2)  # 孤立点标红
+
+        if node['type'] == 'red_box': color = (255, 0, 0)
+        if node['type'] == 'black_box': color = (0, 255, 255)
+        if node['type'] == 'yellow_box': color = (0, 165, 255)  # 橙色
+
+        cv2.circle(vis_final, node['center'], 5, color, -1)
+        cv2.putText(vis_final, str(node['id']), (node['center'][0], node['center'][1] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
+    cv2.imwrite(f"result_page_{page_id}_final.jpg", vis_final)
+
+    # 格式化输出
+    nodes.sort(key=lambda n: n['id'])
+    output = []
+    for n in nodes:
+        output.append({
+            "page": page_id, "id": n['id'], "type": n['type'],
+            "pos": n['center'], "neighbors": sorted(list(n['neighbors']))
+        })
+    return output
+
+
+def save_to_csv_final(all_data, filename="topology_results_final.csv"):
+    print(f"\n正在保存数据到 {filename} ...")
+    with open(filename, mode='w', newline='', encoding='utf-8-sig') as csv_file:
+        fieldnames = ['Node_ID', 'Type', 'Pos_X', 'Pos_Y', 'Neighbors']
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        count = 0
+        for page_data in all_data:
+            for node in page_data:
+                neighbors_str = ";".join(map(str, node['neighbors']))
+                writer.writerow({
+                    'Node_ID': node['id'],
+                    'Type': node['type'],
+                    'Pos_X': node['pos'][0],
+                    'Pos_Y': node['pos'][1],
+                    'Neighbors': neighbors_str
+                })
+                count += 1
+    print(f"保存完成。共 {count} 条记录。")
+
+
+def process_pdf(pdf_path, poppler_path, password):
+    print(f"正在读取 PDF: {pdf_path}")
+    images = convert_from_path(pdf_path, dpi=200, poppler_path=poppler_path, userpw=password)
+    all_pages_data = []
+    for i, pil_img in enumerate(images):
+        img_np = np.array(pil_img)
+        if len(img_np.shape) == 3:
+            img_cv = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+        else:
+            img_cv = cv2.cvtColor(img_np, cv2.COLOR_GRAY2BGR)
+
+        # 调用最终版函数
+        page_results = analyze_and_scan_topology_final(img_cv, page_id=i + 1)
+        all_pages_data.append(page_results)
+
+    save_to_csv_final(all_pages_data)
+
+
+if __name__ == "__main__":
+    # 请修改这里的路径
+    #my_pdf = r"C:\Users\69129\Desktop\python space\pythonProject1\dian\picture\767ce3f95546d1e3c0dbad925bc4b5ac_3bc5441cbd9497a620aa5f8a912d630d_8.pdf"
+    #my_pdf = r"C:\Users\69129\Desktop\python space\pythonProject1\dian\picture\138e68df2d6a8f47093efd4598912f4d_cf53f7b9ab7080425636e9c239100df0_8.pdf"
+    my_pdf = r"C:\Users\69129\Desktop\python space\pythonProject1\dian\picture\0aff7daebb20ca860422a631cefc8613_24fc8778dad47e8dfb3f5e8ac385ff83_8.pdf"
+    my_poppler = r"C:\Users\69129\Desktop\python space\pythonProject1\dian\poppler-25.12.0\Library\bin"
+    my_password = "Dian123456"
+    process_pdf(my_pdf, my_poppler, my_password)
