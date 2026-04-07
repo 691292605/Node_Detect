@@ -605,6 +605,6 @@ if __name__ == "__main__":
     my_pdf = r"C:\Users\69129\Desktop\python space\pythonProject1\dian\picture\138e68df2d6a8f47093efd4598912f4d_cf53f7b9ab7080425636e9c239100df0_8.pdf"
     #my_pdf = r"C:\Users\69129\Desktop\python space\pythonProject1\dian\picture\0aff7daebb20ca860422a631cefc8613_24fc8778dad47e8dfb3f5e8ac385ff83_8.pdf"
     my_poppler = r"C:\Users\69129\Desktop\python space\pythonProject1\dian\poppler-25.12.0\Library\bin"
-    my_password = "Dian123456"
+    my_password = "*******"
 
     process_pdf(my_pdf, my_poppler, my_password)
